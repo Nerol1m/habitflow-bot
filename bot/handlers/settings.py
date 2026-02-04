@@ -1,17 +1,16 @@
 import re
 
 from aiogram import Router
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from bot.database.engine import async_session_maker
 from bot.database.models import User
 from sqlalchemy import select
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import CallbackQuery
 from bot.keyboards.reply import main_kb
 from bot.keyboards.inline import settings_kb, timezone_selection_kb, time_selection_kb
-from celery_worker.tasks import schedule_user_reminder
+from celery_worker.tasks import schedule_user_reminder, cancel_user_reminders
 
 router = Router()
 
@@ -19,7 +18,6 @@ class SettingsForm(StatesGroup):
     waiting_for_custom_timezone = State()
     waiting_for_custom_time = State()
 
-# 1. Обработчик кнопки '⚙️ Настройки'
 @router.message(lambda message: message.text == '⚙️ Настройки')
 @router.message(Command('settings'))
 async def cmd_settings(message: Message):
@@ -44,8 +42,6 @@ async def cmd_settings(message: Message):
 
     await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
-
-# 2. Обработчики кнопки "🕐 Изменить часовой пояс"
 @router.callback_query(lambda c: c.data == "change_timezone")
 async def change_timezone_start(callback: CallbackQuery):
     keyboard = timezone_selection_kb()
@@ -56,7 +52,6 @@ async def change_timezone_start(callback: CallbackQuery):
     )
     await callback.answer()
 
-# Обработчик выбора часового пояса
 @router.callback_query(lambda c: c.data.startswith("tz_"))
 async def change_timezone_finish(callback: CallbackQuery, state: FSMContext):
     tz_value = callback.data.replace("tz_", "")
@@ -66,7 +61,6 @@ async def change_timezone_finish(callback: CallbackQuery, state: FSMContext):
         await state.set_state(SettingsForm.waiting_for_custom_timezone)
         return
 
-    # Обновляем в БД
     async with async_session_maker() as session:
         user = await session.execute(
             select(User).where(User.telegram_id == callback.from_user.id)
@@ -81,10 +75,8 @@ async def change_timezone_finish(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-# Обработчик ручного ввода часового пояса
 @router.message(SettingsForm.waiting_for_custom_timezone)
 async def process_custom_timezone_input(message: Message, state: FSMContext):
-    # Проверяем формат UTC±XX
     tz_pattern = r'^UTC([+-])(0?[0-9]|1[0-4])$'
     match = re.match(tz_pattern, message.text.strip())
 
@@ -99,7 +91,6 @@ async def process_custom_timezone_input(message: Message, state: FSMContext):
     sign, hours = match.groups()
     tz_value = f"UTC{sign}{int(hours):02d}"
 
-    # Сохраняем в БД
     async with async_session_maker() as session:
         result = await session.execute(
             select(User).where(User.telegram_id == message.from_user.id)
@@ -110,7 +101,6 @@ async def process_custom_timezone_input(message: Message, state: FSMContext):
 
     await state.clear()
 
-    # Показываем меню настроек
     keyboard = settings_kb(user)
 
     await message.answer(
@@ -120,8 +110,6 @@ async def process_custom_timezone_input(message: Message, state: FSMContext):
         reply_markup=keyboard
     )
 
-
-# 3. Обработчики кнопки "⏰ Время:..."
 @router.callback_query(lambda c: c.data == "change_reminder_time")
 async def change_reminder_time_start(callback: CallbackQuery):
     keyboard = time_selection_kb()
@@ -132,7 +120,6 @@ async def change_reminder_time_start(callback: CallbackQuery):
     )
     await callback.answer()
 
-# Обработчик сохранения времени
 @router.callback_query(lambda c: c.data.startswith("remtime_"))
 async def change_reminder_time_finish(callback: CallbackQuery, state: FSMContext):
     time_value = callback.data.replace("remtime_", "")
@@ -149,7 +136,6 @@ async def change_reminder_time_finish(callback: CallbackQuery, state: FSMContext
         await callback.answer("❌ Неверный формат времени. Используйте ЧЧ:ММ", show_alert=True)
         return
 
-    # Сохраняем в БД
     async with async_session_maker() as session:
         result = await session.execute(
             select(User).where(User.telegram_id == callback.from_user.id)
@@ -158,7 +144,8 @@ async def change_reminder_time_finish(callback: CallbackQuery, state: FSMContext
         user.reminder_time = time_value
         await session.commit()
 
-    if user.reminders_enabled:  # Только если напоминания включены
+    cancel_user_reminders.delay(user_id=callback.from_user.id)
+    if user.reminders_enabled:
         schedule_user_reminder.delay(
             user_id=callback.from_user.id,
             reminder_time=time_value,
@@ -172,10 +159,8 @@ async def change_reminder_time_finish(callback: CallbackQuery, state: FSMContext
     )
     await callback.answer()
 
-# Обработчик ручного сохранения времени
 @router.message(SettingsForm.waiting_for_custom_time)
 async def process_custom_time_input(message: Message, state: FSMContext):
-    # Проверяем формат ЧЧ:ММ
     time_pattern = r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
 
     if not re.match(time_pattern, message.text):
@@ -187,7 +172,6 @@ async def process_custom_time_input(message: Message, state: FSMContext):
 
     time_value = message.text
 
-    # Сохраняем в БД
     async with async_session_maker() as session:
         result = await session.execute(
             select(User).where(User.telegram_id == message.from_user.id)
@@ -196,6 +180,7 @@ async def process_custom_time_input(message: Message, state: FSMContext):
         user.reminder_time = time_value
         await session.commit()
 
+    cancel_user_reminders.delay(user_id=message.from_user.id)
     if user.reminders_enabled:
         schedule_user_reminder.delay(
             user_id=message.from_user.id,
@@ -203,10 +188,8 @@ async def process_custom_time_input(message: Message, state: FSMContext):
             timezone=user.timezone
         )
 
-    # Возвращаем в меню настроек
     await state.clear()
 
-    # Показываем обновлённые настройки
     keyboard = settings_kb(user, time_value)
 
     await message.answer(
@@ -216,8 +199,6 @@ async def process_custom_time_input(message: Message, state: FSMContext):
         reply_markup=keyboard
     )
 
-
-# 4. Обработчик кнопки "Напоминания"
 @router.callback_query(lambda c: c.data == "toggle_reminders")
 async def toggle_reminders(callback: CallbackQuery):
     async with async_session_maker() as session:
@@ -225,20 +206,22 @@ async def toggle_reminders(callback: CallbackQuery):
             select(User).where(User.telegram_id == callback.from_user.id)
         )
         user = user.scalar_one()
-        user.reminders_enabled = not user.reminders_enabled
+
+        new_status = not user.reminders_enabled
+        user.reminders_enabled = new_status
+
+        if new_status:
+            schedule_user_reminder.delay(
+                user_id=callback.from_user.id,
+                reminder_time=user.reminder_time,
+                timezone=user.timezone
+            )
+        else:
+            cancel_user_reminders.delay(user_id=callback.from_user.id)
+
         await session.commit()
 
-        status = "включены" if user.reminders_enabled else "выключены"
-
-    if user.reminders_enabled:  # Если ВКЛЮЧАЕМ
-        schedule_user_reminder.delay(
-            user_id=callback.from_user.id,
-            reminder_time=user.reminder_time,
-            timezone=user.timezone
-        )
-    else:  # Если ВЫКЛЮЧАЕМ
-        # TODO: отменить существующие задачи
-        pass
+        status = "включены" if new_status else "выключены"
 
     await callback.message.edit_text(
         f"✅ Напоминания <b>{status}</b>\n\n"
@@ -247,8 +230,6 @@ async def toggle_reminders(callback: CallbackQuery):
     )
     await callback.answer()
 
-
-# 5. Обработчик кнопки "⬅️ Назад"
 @router.callback_query(lambda c: c.data == "back_to_main")
 async def back_to_main_settings(callback: CallbackQuery):
     await callback.message.answer(
